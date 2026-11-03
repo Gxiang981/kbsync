@@ -60,6 +60,9 @@ kbsync 的每台机器维护一个状态：
 | macOS 上那个接收器**不回复 `getHostInfo`（读通道）**，只回 `getFeature`（探存在） | 判断「键盘在不在我這」必须用 `getFeature`；读通道失败 **≠** 键盘不在 |
 | 键盘回包本身**间歇性**（同样 400ms 超时，有时有有时没有） | 发现设备要**记住上次成功的槽位**，一次全量扫描十几秒会错过「刚醒」的窗口 |
 | macOS 的输入监控权限按**文件路径 + 二进制哈希**绑定 | 每次重新编译 `tools/mxhid.c` 都要**重新授权一次** |
+| **接收器会替「已配对但不在本机」的设备应答** | 在 macOS 上「设备是否在我这」会假阳性 → 该端只能靠「切换后复核」判定成败 |
+| 设备睡着时写入会被**丢弃**，而「切换后设备不再应答」和「设备一直没醒」长得一样 | 会造成**假成功**（两边都以为切过去了，其实没动）→ 必须切换后复核，且切换前先确认设备醒着 |
+| 进程不在**交互会话**里时读不到光标 | Windows 端必须登录后启动（启动文件夹 / 任务计划「仅用户登录时」），否则永远检测不到鼠标活动 |
 
 **因此实际使用节奏是**：换到某台机器后**顺手敲一下键盘**，之后那台就能随时把它切走；
 如果离开时那台机器上很久没敲过字（键盘已睡），就切不动，需要手动按 F2 / F3。
@@ -180,7 +183,12 @@ schtasks /Create /TN "kbsync" /SC ONLOGON /RL LIMITED ^
   /TR "\"C:\path\pythonw.exe\" \"C:\path\kbsync.py\" --config \"C:\path\config.json\""
 ```
 
-或者直接双击 `run-windows.bat`（先改好里面的路径）。
+或者直接双击 `run-windows.bat`（先改好里面的路径），或者把 `run-windows.bat`
+复制到 `shell:startup` 目录让它登录自启。
+
+> ⚠️ **必须跑在交互会话里**（登录之后启动）。跑在服务/会话 0 里会读不到光标位置，
+> agent 会一直报「鼠标采样失败」，也就永远检测不到你在用哪台机器。
+
 
 **macOS**（launchd）：把 `com.kbsync.agent.plist` 里的路径改成你自己的，然后
 
@@ -228,13 +236,22 @@ python -m py_compile kbsync.py hidpp_win.py
 
 ```jsonc
 // 请求
-{"v":1,"type":"active","machine":"win","channel":2,"secret":"..."}
+{"v":1,"type":"active","machine":"win","channel":2,"secret":"..."}   // 请求把键盘交到通道 2
+{"v":1,"type":"status","machine":"probe","secret":"..."}            // 查询对方状态
+{"v":1,"type":"ping","machine":"probe","secret":"..."}               // 探活
 // 响应
 {"result":"switched"}   // 对端持有键盘，已推过来
-{"result":"not_host"}   // 对端没有键盘
-{"result":"busy"}       // 对端正在使用（打字保护）/ 冷却中，稍后重试
+{"result":"not_host"}   // 对端没有键盘（我这儿也没有）
+{"result":"busy"}       // 对端正在使用（打字保护）/ 冷却中 / 切不动（可能休眠），稍后重试
 {"result":"error"}      // 校验失败 / 对端异常
 {"result":"pong"}       // ping
+{"result":"status","machine":"mac","state":"host","channel":3,"device":true}
+```
+
+排查小技巧：直接对某一端发 `status`，能看到它认为的状态、读到的通道、是否看到设备：
+
+```bash
+printf '{"v":1,"type":"status","machine":"probe","secret":"<你的 secret>"}\n' | nc 192.168.31.122 52845
 ```
 
 ---

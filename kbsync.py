@@ -441,6 +441,12 @@ _CHANNEL_RE = re.compile(r"channel[^0-9]{0,20}(\d)", re.IGNORECASE)
 
 
 class KeyboardController:
+    #: 能否可靠判断「设备真的在我这」。
+    #: 原生 HID++ 能读回当前通道 -> True；
+    #: mxswitch / mxhid 只能看「设备是否应答」，而接收器会替「已配对但不在本机」
+    #: 的设备应答，存在假阳性 -> False。
+    reliable_state = True
+
     def info(self) -> ControllerInfo:
         raise NotImplementedError
 
@@ -453,6 +459,8 @@ class KeyboardController:
 
 
 class MxSwitchController(KeyboardController):
+    reliable_state = False
+
     """调用 mxswitch 发 HID++ 指令。
 
     Windows 上 mxswitch 是 .ps1，必须用 powershell 跑；macOS 直接跑二进制。
@@ -650,6 +658,8 @@ class HidppKeyboardController(KeyboardController):
 
 
 class MxhidController(KeyboardController):
+    reliable_state = False
+
     """macOS 原生 HID++ 助手（tools/mxhid.c 的编译产物）的客户端。
 
     助手常驻打开键盘设备，每 500ms 自动 ping 一次：
@@ -763,7 +773,15 @@ class MxhidController(KeyboardController):
         if not 1 <= int(channel) <= 3:
             return False
         reply = self._call("switch %d" % int(channel))
-        return int(reply.get("ok", 0)) == 1
+        if int(reply.get("ok", 0)) != 1:
+            return False
+        # mxswitch 用「设备不再应答」判定成功，但设备休眠时写入会被丢弃、
+        # 同样表现为「不再应答」——所以再复核一次：设备还在就说明根本没切成。
+        for _ in range(3):
+            time.sleep(0.15)
+            if not self.info().device_ok:
+                return True
+        return False
 
     def keepalive(self) -> bool:
         # 助手自己每 500ms 保活，这里只确认它还活着
@@ -870,6 +888,7 @@ class Engine:
         self._activity_streak: List[float] = []
         self._streak_lock = threading.Lock()
         self._host_miss = 0
+        self._host_hits = 0
         self._verify_until = 0.0
         self._verify_attempts = 0
         self._preverify_miss = 0
@@ -902,8 +921,12 @@ class Engine:
                 self._last_probe = now
                 info = self.controller.info()
                 if info.device_ok:
-                    self.state = State.HOST
-                    log.info("定时自检发现键盘在本机 -> HOST（channel=%s）", info.channel)
+                    self._host_hits += 1
+                    if self._host_hits >= 2:
+                        self.state = State.HOST
+                        log.info("定时自检确认键盘在本机 -> HOST（channel=%s）", info.channel)
+                else:
+                    self._host_hits = 0
             return
         now = self.now()
         if now - self._last_keepalive < interval:
@@ -943,8 +966,12 @@ class Engine:
         self._last_probe = now
         info = self.controller.info()
         if info.device_ok:
-            self.state = State.HOST
-            log.info("输入活动自检发现键盘在本机 -> HOST（channel=%s）", info.channel)
+            self._host_hits += 1
+            if self._host_hits >= 2:
+                self.state = State.HOST
+                log.info("输入活动自检确认键盘在本机 -> HOST（channel=%s）", info.channel)
+        else:
+            self._host_hits = 0
 
     def on_local_activity(self, strength: str = "click") -> None:
         now = self.now()
@@ -1040,7 +1067,18 @@ class Engine:
     def handle_request(self, request: Dict[str, object]) -> Dict[str, object]:
         if not isinstance(request, dict):
             return {"result": "error"}
-        if request.get("type") != "active" or request.get("v") != PROTOCOL_VERSION:
+        if request.get("v") != PROTOCOL_VERSION:
+            return {"result": "error"}
+        if request.get("type") == "status":
+            info = self.controller.info()
+            return {
+                "result": "status",
+                "machine": self.cfg.machine,
+                "state": self.state.value,
+                "channel": info.channel,
+                "device": bool(info.device_ok),
+            }
+        if request.get("type") != "active":
             return {"result": "error"}
         if self.cfg.secret and request.get("secret") != self.cfg.secret:
             return {"result": "error"}
@@ -1057,7 +1095,13 @@ class Engine:
         if now < self._suppress_until:
             log.debug("切换冷却中，暂不交出键盘")
             return {"result": "busy"}
-        if self.state is State.NOT_HOST:
+
+        # 后端能否可靠自证「设备真的在我这」：
+        #   原生 HID++ 能读回当前通道 -> 可以据此拒绝；
+        #   mxswitch / mxhid 只能看「设备是否应答」，接收器会替不在本机的设备应答，
+        #   存在假阳性 -> 不做前置判断，直接尝试切换，由「切换后复核」判定成败。
+        reliable = getattr(self.controller, "reliable_state", True)
+        if self.state is State.NOT_HOST and reliable:
             # 不在本机就直接回绝；状态恢复交给本地活动时的自检（避免每个请求都跑慢速探测）
             return {"result": "not_host"}
 
@@ -1066,21 +1110,22 @@ class Engine:
             log.debug("本机 %.0fms 前还有输入，暂不交出键盘", idle * 1000.0)
             return {"result": "busy"}
 
-        # 交接前必须真正读到「键盘当前通道」，确认它醒着且确实在本机；
-        # 否则 mxswitch 的「设备不再应答=成功」会在键盘休眠时假成功。
-        before = self.controller.info()
-        self._last_probe = now
-        if not before.device_ok:
-            self._preverify_miss += 1
-            if self._preverify_miss < 2:
-                log.info("请求到达但探测不到键盘（可能休眠），让对端稍后重试")
-                return {"result": "busy"}
-            # 连续探测不到：更可能是键盘真的不在这台机器上，如实告诉对端
+        if reliable:
+            # 交接前必须真正读到「键盘当前通道」，确认它醒着且确实在本机；
+            # 否则「切换后不再应答」会在键盘休眠时假成功。
+            before = self.controller.info()
+            self._last_probe = now
+            if not before.device_ok:
+                self._preverify_miss += 1
+                if self._preverify_miss < 2:
+                    log.info("请求到达但探测不到键盘（可能休眠），让对端稍后重试")
+                    return {"result": "busy"}
+                # 连续探测不到：更可能是键盘真的不在这台机器上，如实告诉对端
+                self._preverify_miss = 0
+                self.state = State.NOT_HOST
+                log.info("连续探测不到键盘，转入 NOT_HOST 并回复 not_host")
+                return {"result": "not_host"}
             self._preverify_miss = 0
-            self.state = State.NOT_HOST
-            log.info("连续探测不到键盘，转入 NOT_HOST 并回复 not_host")
-            return {"result": "not_host"}
-        self._preverify_miss = 0
 
         ok = self.controller.switch_to(channel)
         if ok:
@@ -1089,6 +1134,10 @@ class Engine:
             log.info("键盘已交给对端（通道 %d），冷却 %.0fs",
                      channel, self.cfg.switch_cooldown_ms / 1000.0)
             return {"result": "switched"}
+        # 切换失败：区分「我这儿根本没键盘」和「切不动（可能休眠）」
+        if not reliable and not self.controller.info().device_ok:
+            self.state = State.NOT_HOST
+            return {"result": "not_host"}
         # 切换失败多半是键盘休眠；不要断言 not_host，让对端稍后重试
         log.warning("切换失败（键盘可能休眠），告诉对端稍后重试")
         return {"result": "busy"}
@@ -1231,6 +1280,7 @@ def run_monitor(
 
     last_tick = 0.0
     last_input_check = 0.0
+    last_sample_error = 0.0
     while not stop.is_set():
         started = time.monotonic()
         try:
@@ -1248,8 +1298,12 @@ def run_monitor(
             if started - last_tick >= 0.5:
                 last_tick = started
                 submit_keepalive()
-        except Exception:  # noqa: BLE001 - 单次采样失败不能停掉整个循环
-            log.exception("鼠标采样失败")
+        except Exception as exc:  # noqa: BLE001 - 单次采样失败不能停掉整个循环
+            # 锁屏 / 会话断开时 GetCursorPos 会持续失败，限频记录即可
+            now = time.monotonic()
+            if now - last_sample_error > 60.0:
+                last_sample_error = now
+                log.warning("鼠标采样失败（会话可能已锁定或断开）: %s", exc)
         elapsed = time.monotonic() - started
         stop.wait(max(0.0, interval - elapsed))
 

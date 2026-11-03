@@ -555,6 +555,23 @@ class WindowsHidppController:
         iface = self._interface_for(str(self._device["path"]))
         if iface is None:
             return False
+
+        # 关键：先确认设备「醒着」（能读到当前通道）。
+        # 设备睡着时写入会被丢弃，如果只靠「切换后是否还应答」判断，
+        # 会把「设备睡了、根本没切」误判成切换成功（假成功）。
+        current = None
+        for _ in range(4):
+            found, ch = self.info()
+            if found:
+                current = ch
+                break
+            time.sleep(0.15)
+        if current is None:
+            log.debug("设备无应答（可能已休眠），放弃本次切换")
+            return False
+        if current == int(channel):
+            return True
+
         frame = _frame(int(self._device["report_id"]), int(self._device["device_index"]),
                        int(self._device["feature_index"]), 1,
                        bytes([int(channel) - 1]))
@@ -562,12 +579,21 @@ class WindowsHidppController:
             return False
         if not _write(iface.handle, frame):
             return False
-        # setCurrentHost 不回复；用「设备是否已停止应答」复核（getFeature 探测）
-        time.sleep(0.15)
-        if not self._presence(150):
-            return True
-        time.sleep(0.2)
-        return not self._presence(150)
+        # setCurrentHost 不回复：用「设备是否已停止应答 / 通道是否已变」来复核。
+        # 要求连续两次确认「设备已离开」才算成功，避免把设备偶发不应答误判成切换成功。
+        absent = 0
+        for _ in range(10):
+            time.sleep(0.12)
+            found, ch = self.info()
+            if found and ch == int(channel):
+                return True
+            if found:
+                absent = 0
+                continue
+            absent += 1
+            if absent >= 2:
+                return True      # 设备确实离开了本机 = 切换成功
+        return False
 
     def keepalive(self) -> bool:
         """发一帧无害的 getHostInfo，尽量让键盘别睡。"""
