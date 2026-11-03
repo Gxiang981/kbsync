@@ -1,0 +1,23 @@
+# 本地配置（含密钥，不要提交）
+config.json
+config.mac.json
+config.run.json
+config.local.json
+
+# 运行时产物
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# macOS 助手编译产物
+tools/mxhid
+tools/*.new
+*.dSYM/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS 开机自启模板：
+    1. 把 3 处 /Users/you/... 换成你的真实路径
+    2. cp com.kbsync.agent.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.kbsync.agent.plist
+  提示：如果 /usr/bin/python3 没有输入监控权限，可以换成 Homebrew 的
+  /opt/homebrew/bin/python3，或给 mxswitch 二进制单独授权即可（kbsync 本身
+  只读取光标位置和空闲时间，通常不需要额外权限）。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kbsync.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/you/tools/kbsync/kbsync.py</string>
+        <string>--config</string>
+        <string>/Users/you/tools/kbsync/config.json</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/kbsync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kbsync.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
