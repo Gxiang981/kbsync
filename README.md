@@ -143,7 +143,7 @@ cd ..
 {
   "machine": "win",            // 两端不能重名
   "my_channel": 2,             // 本机对应的键盘通道（Windows=F2 → 2，Mac=F3 → 3）
-  "peer": "192.168.31.122",    // 对端 IP（建议固定 IP 或 DHCP 保留）
+  "peer": "192.168.1.23",    // 对端 IP（建议固定 IP 或 DHCP 保留）
   "port": 52845,               // 两端一致
   "secret": "换成只有你知道的一串字符",   // 两端一致
   "backend": "auto",           // auto | hidpp | mxhid | mxswitch

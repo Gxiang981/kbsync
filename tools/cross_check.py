@@ -8,7 +8,7 @@
 
 在另一台机器上跑客户端：
 
-    python3 tools/cross_check.py call --peer 192.168.31.212 --port 52860 \
+    python3 tools/cross_check.py call --peer 192.168.1.42 --port 52860 \
         --secret s3cret --channel 2
 
 预期：ping 返回 pong，active 返回 switched（说明对端能收到并会「切键盘」），
