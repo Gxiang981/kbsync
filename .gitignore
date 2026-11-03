@@ -5,6 +5,8 @@ config.run.json
 config.local.json
 
 # 运行时产物
+hidpp-cache*.json
+mxhid-device
 *.log
 __pycache__/
 *.pyc
