@@ -11,14 +11,19 @@
 ' Every helper command runs through cmd.exe with window style 0 (hidden) and
 ' its output redirected to a temp file. Shell.Exec would flash a console
 ' window on every check.
+'
+' Liveness check uses the agent's PID file (~/.kbsync/agent.pid) - tasklist
+' in CSV mode does NOT include the command line, so filtering by "kbsync.py"
+' there never matches (and would restart the agent every 30 s).
 Option Explicit
 
-Dim fso, sh, py, cfg, running, outText, ln, project, tmpDir, outFile
+Dim fso, sh, py, cfg, project, tmpDir, outFile, pidFile, agentPid, outText
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
 py = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\Python\Python312\pythonw.exe"
 tmpDir = sh.ExpandEnvironmentStrings("%TEMP%")
+pidFile = sh.ExpandEnvironmentStrings("%USERPROFILE%") & "\.kbsync\agent.pid"
 
 Function RunHidden(cmdText)
     Dim res
@@ -37,15 +42,6 @@ Function RunHidden(cmdText)
     RunHidden = res
 End Function
 
-Function AgentRunning()
-    Dim outText2, ln2
-    AgentRunning = False
-    outText2 = RunHidden("tasklist /FI ""IMAGENAME eq pythonw.exe"" /FO CSV /NH")
-    For Each ln2 In Split(outText2, vbCrLf)
-        If InStr(ln2, "kbsync.py") > 0 Then AgentRunning = True
-    Next
-End Function
-
 Function FindProject()
     Dim item
     FindProject = ""
@@ -59,14 +55,28 @@ Function FindProject()
     Next
 End Function
 
+' agent 是否在运行：读 PID 文件，再用 tasklist 按 PID 过滤（按 PID 过滤时会输出进程名）
+Function AgentAlive()
+    Dim pidText, outText2
+    AgentAlive = False
+    On Error Resume Next
+    If Not fso.FileExists(pidFile) Then Exit Function
+    pidText = Trim(fso.OpenTextFile(pidFile, 1).ReadAll)
+    On Error GoTo 0
+    If pidText = "" Then Exit Function
+    If Not IsNumeric(pidText) Then Exit Function
+    outText2 = RunHidden("tasklist /FI ""PID eq " & CLng(pidText) & """ /NH")
+    If InStr(outText2, "python") > 0 Then AgentAlive = True
+End Function
+
 Do While True
     project = FindProject()
     If project <> "" Then
         cfg = project & "\config.json"
-        If Not AgentRunning() Then
-            ' check once more before starting, so two watchdogs cannot spawn two agents
+        If Not AgentAlive() Then
+            ' 再确认一次，避免两个看门狗同时起两个 agent
             WScript.Sleep 1500
-            If Not AgentRunning() Then
+            If Not AgentAlive() Then
                 sh.Run """" & py & """ """ & project & "\kbsync.py"" --config """ & cfg & """", 0, False
             End If
         End If

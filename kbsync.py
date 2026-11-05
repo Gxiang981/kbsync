@@ -622,6 +622,13 @@ class MxSwitchController(KeyboardController):
             if code == 0:
                 if attempt > 1:
                     log.debug("mxswitch 第 %d/%d 次尝试切换成功", attempt, attempts)
+                # 复核：mxswitch 用「设备不再应答」判定成功，但设备休眠时写入会被丢弃、
+                # 同样表现为「不再应答」——所以连续确认几次「真的不在了」才算成功。
+                for _ in range(2):
+                    time.sleep(0.2)
+                    if not self.info().device_ok:
+                        continue
+                    return False
                 return True
             log.debug("mxswitch 切换失败 (exit=%d, 第 %d/%d 次): %s",
                       code, attempt, attempts, out[:160])
@@ -820,7 +827,7 @@ class TcpLink:
 
     def request(self, payload: Dict[str, object], timeout: Optional[float] = None) -> Dict[str, object]:
         connect_timeout = 1.0
-        read_timeout = timeout if timeout is not None else 8.0
+        read_timeout = timeout if timeout is not None else 40.0
         data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         try:
             with socket.create_connection(
@@ -1104,8 +1111,13 @@ class Engine:
         #   存在假阳性 -> 不做前置判断，直接尝试切换，由「切换后复核」判定成败。
         reliable = getattr(self.controller, "reliable_state", True)
         if self.state is State.NOT_HOST and reliable:
-            # 不在本机就直接回绝；状态恢复交给本地活动时的自检（避免每个请求都跑慢速探测）
-            return {"result": "not_host"}
+            # 状态可能已经过期（键盘刚被切回来、还没轮到复核）——
+            # 先探一次再决定，别急着回绝，否则对端要等下一次自检才拿得到键盘。
+            probe_info = self.controller.info()
+            self._last_probe = now
+            if not probe_info.device_ok:
+                return {"result": "not_host"}
+            log.debug("状态是 NOT_HOST，但实测键盘就在本机，继续执行切换")
 
         idle = self.probe.seconds_since_last_input()
         if idle is not None and idle * 1000.0 < self.cfg.release_idle_ms:
@@ -1178,7 +1190,7 @@ class EngineRunner:
         self._queue.put((fn, args, None))
 
     def call(self, fn: Callable[..., Dict[str, object]], *args: object,
-             timeout: float = 12.0) -> Dict[str, object]:
+             timeout: float = 35.0) -> Dict[str, object]:
         result = _Result()
         self._queue.put((fn, args, result))
         if not result.event.wait(timeout):
@@ -1202,7 +1214,17 @@ class EngineRunner:
 
 class RequestServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows 上默认的 SO_REUSEADDR 允许两个进程绑同一个端口，
+    # 会导致两个 agent 同时监听、请求被随机分发 —— 必须关掉。
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt":
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                pass
+        super().server_bind()
 
     def __init__(self, address: Tuple[str, int], engine: Engine,
                  runner: EngineRunner, secret: str) -> None:
@@ -1449,6 +1471,12 @@ def cmd_self_test(cfg: Config) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if pid_file is not None:
+            try:
+                if pid_file.exists() and pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    pid_file.unlink()
+            except OSError:
+                pass
         try:
             probe.warp(int(start_x), int(start_y))
         except Exception:  # noqa: BLE001
@@ -1467,6 +1495,15 @@ def cmd_self_test(cfg: Config) -> int:
 
 
 def run_agent(cfg: Config, dry_run: bool) -> int:
+    # 先确认端口没被占用，再去做任何硬件探测（否则重复实例会跟真实例抢 HID 设备）
+    for _ in range(12):
+        if not _local_port_busy(int(cfg.port)):
+            break
+        time.sleep(0.5)
+    else:
+        log.error("端口 %d 已被占用（可能已有一个实例在运行），本次退出", cfg.port)
+        return 2
+
     probe = make_probe()
     controller = make_controller(cfg, dry_run=dry_run)
     link = TcpLink(cfg)
@@ -1474,12 +1511,26 @@ def run_agent(cfg: Config, dry_run: bool) -> int:
     runner = EngineRunner(engine)
     runner.start()
 
+    pid_file = Path.home() / ".kbsync" / "agent.pid"
     try:
         # 端口已被占用 = 已经有一个实例在跑（看门狗/自启可能重复拉起），
         # 直接退出，避免两个实例抢同一个通道。
-        if _local_port_busy(int(cfg.port)):
+        # 端口被占用：可能是「另一个实例还活着」，也可能是「上一个实例正在退出」。
+        # 先等几秒再判断，避免重启竞态把新实例误杀。
+        for _ in range(12):
+            if not _local_port_busy(int(cfg.port)):
+                break
+            time.sleep(0.5)
+        else:
             log.error("端口 %d 已被占用（可能已有一个实例在运行），本次退出", cfg.port)
             return 2
+
+        # 拿到端口了才登记 PID（重复实例在上面的分支已经退出了，不会覆盖）
+        try:
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
 
         server = RequestServer(("0.0.0.0", int(cfg.port)), engine, runner, cfg.secret)
     except OSError as exc:
@@ -1531,15 +1582,19 @@ def _configure_stdio() -> None:
 
 
 def _local_port_busy(port: int) -> bool:
-    """本机该端口是否已经有进程在监听。"""
+    """本机该端口是否已经被占用（试着独占绑定一下，绑不上就是有人占着）。"""
     import socket as _socket
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.5)
+        if os.name == "nt":
+            try:
+                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                pass
         try:
-            sock.connect(("127.0.0.1", port))
-            return True
+            sock.bind(("0.0.0.0", port))
         except OSError:
-            return False
+            return True
+    return False
 
 
 def main(argv: Optional[List[str]] = None) -> int:

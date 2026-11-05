@@ -577,22 +577,32 @@ class WindowsHidppController:
                        bytes([int(channel) - 1]))
         if not iface.open() or iface.handle is None:
             return False
-        if not _write(iface.handle, frame):
-            return False
-        # setCurrentHost 不回复：用「设备是否已停止应答 / 通道是否已变」来复核。
-        # 要求连续两次确认「设备已离开」才算成功，避免把设备偶发不应答误判成切换成功。
-        absent = 0
-        for _ in range(10):
-            time.sleep(0.12)
-            found, ch = self.info()
-            if found and ch == int(channel):
-                return True
-            if found:
-                absent = 0
-                continue
-            absent += 1
-            if absent >= 2:
-                return True      # 设备确实离开了本机 = 切换成功
+
+        # 反复写入直到通道真的变了。
+        # 实测：对半睡的键盘写一次 setCurrentHost 只会把它「叫醒」（设备沉默约 2 秒后
+        # 重新连上，但仍停在原通道），必须等它醒透再写一次才会真正切换。
+        for attempt in range(1, 5):
+            if not _write(iface.handle, frame):
+                return False
+            # 等待并确认：沉默 = 正在重连；报出目标通道 = 切换成功；仍是原通道 = 这次没生效
+            for _ in range(8):
+                time.sleep(0.25)
+                found, ch = self.info()
+                if found:
+                    if ch == int(channel):
+                        return True
+                    if ch == current:
+                        break        # 还在原通道，设备刚醒，再写一次
+                    return False
+                # 设备沉默中（重连/休眠），继续等
+            else:
+                # 一直沉默：大概率已经切走了，再确认一次
+                time.sleep(0.8)
+                found2, ch2 = self.info()
+                if not found2:
+                    return True
+                if ch2 == int(channel):
+                    return True
         return False
 
     def keepalive(self) -> bool:
