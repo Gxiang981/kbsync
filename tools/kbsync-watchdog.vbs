@@ -55,7 +55,7 @@ Function FindProject()
     Next
 End Function
 
-' agent 是否在运行：读 PID 文件，再用 tasklist 按 PID 过滤（按 PID 过滤时会输出进程名）
+' Is the agent alive: read the PID file, then ask tasklist for that PID
 Function AgentAlive()
     Dim pidText, outText2
     AgentAlive = False
@@ -74,7 +74,7 @@ Do While True
     If project <> "" Then
         cfg = project & "\config.json"
         If Not AgentAlive() Then
-            ' 再确认一次，避免两个看门狗同时起两个 agent
+            ' check once more, so two watchdogs cannot start two agents
             WScript.Sleep 1500
             If Not AgentAlive() Then
                 sh.Run """" & py & """ """ & project & "\kbsync.py"" --config """ & cfg & """", 0, False

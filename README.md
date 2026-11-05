@@ -203,6 +203,14 @@ wscript "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\kbsync-watchdog
 看门狗做了单例保护（已有实例在跑就直接退出）；agent 自身也有第二道保险：
 启动时发现端口已被占用就退出，避免两个实例抢同一个通道。
 
+> ⚠️ **写 `.vbs` 启动脚本的两个坑**（都踩过）：
+> 1. `sub` 是 VBScript 的**保留字**，`For Each sub In ...` 会直接报
+>    「缺少标识符 / Microsoft VBScript 编译器错误 800A03F2」，脚本根本不会运行；
+> 2. `cscript` / `wscript` 按 **ANSI** 解析 `.vbs`，文件里混了中文（UTF-8）可能
+>    被当成乱码导致语法错误 → **`.vbs` 一律写纯 ASCII**。
+>
+> 排查方法：`cscript //nologo 你的.vbs`，语法错会直接打印错误行号。
+
 
 **macOS**（launchd）：把 `com.kbsync.agent.plist` 里的路径改成你自己的，然后
 
