@@ -906,12 +906,14 @@ class Engine:
                     self._verify_until = 0.0
                     self._last_probe = now
                     log.debug("切换后复核通过（第 %d 次）", self._verify_attempts)
-                elif self._verify_attempts >= 3:
+                elif self._verify_attempts >= 8:
+                    # 键盘切到新通道后可能要 5~10 秒才重新连上，别急着放弃
                     self._verify_until = 0.0
                     self.state = State.NOT_HOST
-                    log.info("切换后复核 3 次仍探测不到，转入 NOT_HOST")
+                    log.info("切换后复核 %d 次仍探测不到，转入 NOT_HOST",
+                             self._verify_attempts)
                 else:
-                    self._verify_until = now + 1.0
+                    self._verify_until = now + 1.5
         interval = self.cfg.keepalive_ms / 1000.0
         if interval <= 0:
             return
@@ -1041,7 +1043,7 @@ class Engine:
             self._suppress_until = now + self.cfg.switch_cooldown_ms / 1000.0
             self._last_probe = now
             self._host_miss = 0
-            self._verify_until = now + 2.0   # 给键盘 2 秒连接时间再复核
+            self._verify_until = now + 3.0   # 给键盘 3 秒连接时间再复核
             self._verify_attempts = 0
             log.info("键盘已切到本机（通道 %d），冷却 %.0fs",
                      self.cfg.my_channel, self.cfg.switch_cooldown_ms / 1000.0)
@@ -1473,6 +1475,12 @@ def run_agent(cfg: Config, dry_run: bool) -> int:
     runner.start()
 
     try:
+        # 端口已被占用 = 已经有一个实例在跑（看门狗/自启可能重复拉起），
+        # 直接退出，避免两个实例抢同一个通道。
+        if _local_port_busy(int(cfg.port)):
+            log.error("端口 %d 已被占用（可能已有一个实例在运行），本次退出", cfg.port)
+            return 2
+
         server = RequestServer(("0.0.0.0", int(cfg.port)), engine, runner, cfg.secret)
     except OSError as exc:
         log.error("监听 0.0.0.0:%d 失败: %s", cfg.port, exc)
@@ -1520,6 +1528,18 @@ def _configure_stdio() -> None:
                 stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError, OSError):
             pass
+
+
+def _local_port_busy(port: int) -> bool:
+    """本机该端口是否已经有进程在监听。"""
+    import socket as _socket
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        try:
+            sock.connect(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
 
 
 def main(argv: Optional[List[str]] = None) -> int:

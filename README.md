@@ -189,6 +189,18 @@ schtasks /Create /TN "kbsync" /SC ONLOGON /RL LIMITED ^
 > ⚠️ **必须跑在交互会话里**（登录之后启动）。跑在服务/会话 0 里会读不到光标位置，
 > agent 会一直报「鼠标采样失败」，也就永远检测不到你在用哪台机器。
 
+**强烈建议加看门狗**：进程可能因为各种原因（系统清理、脚本管理工具、崩溃）悄悄消失，
+而「进程没了」和「键盘切不动」在体感上完全一样。`tools/kbsync-watchdog.vbs` 每 30 秒检查一次，
+发现 agent 不在就把它拉起来：
+
+```powershell
+copy tools\kbsync-watchdog.vbs "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\"
+wscript "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\kbsync-watchdog.vbs"   # 立刻生效
+```
+
+看门狗做了单例保护（已有实例在跑就直接退出）；agent 自身也有第二道保险：
+启动时发现端口已被占用就退出，避免两个实例抢同一个通道。
+
 
 **macOS**（launchd）：把 `com.kbsync.agent.plist` 里的路径改成你自己的，然后
 
